@@ -86,6 +86,9 @@ pub struct HttpSession {
     /// Number of times the upstream connection associated with this session can be reused
     /// after this session ends
     keepalive_reuses_remaining: Option<u32>,
+    /// Whether the client has half-closed the TCP connection (sent FIN).
+    /// When true, the read side is at EOF but the write side may still be usable.
+    half_closed: bool,
 }
 
 impl HttpSession {
@@ -126,6 +129,7 @@ impl HttpSession {
             // default on to avoid rejecting requests after body as pipelined
             close_on_response_before_downstream_finish: true,
             keepalive_reuses_remaining: None,
+            half_closed: false,
         }
     }
 
@@ -937,25 +941,39 @@ impl HttpSession {
     /// This function will return body bytes (same as [`Self::read_body_bytes()`]), but after
     /// the client body finishes (`Ok(None)` is returned), calling this function again will block
     /// forever, same as [`Self::idle()`].
+    ///
+    /// If the client half-closes the connection (sends TCP FIN) after the request body is
+    /// complete, this future stays pending instead of returning an error. The write side of
+    /// the connection may still be usable, so the proxy can finish delivering the upstream
+    /// response. A true disconnect (RST) will be caught later when the response write fails.
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
         if no_body_expected || self.is_body_done() {
+            if self.half_closed {
+                // Already detected half-close; stay pending so the proxy loop can
+                // continue delivering the upstream response via the write path.
+                return std::future::pending().await;
+            }
             // XXX: account for upgraded body reader change, if the read half split from the write half
             let read = self.idle().await?;
             if read == 0 {
-                Error::e_explain(
-                    ConnectionClosed,
-                    if self.response_written.is_none() {
-                        "Prematurely before response header is sent"
-                    } else {
-                        "Prematurely before response body is complete"
-                    },
-                )
+                // Client sent FIN (half-close). The write side may still work, so
+                // mark the session and stay pending rather than aborting the proxy.
+                // If the client is truly gone, the next write will produce an error.
+                self.half_closed = true;
+                self.set_keepalive(None);
+                debug!("downstream half-closed (FIN), keeping write side open");
+                std::future::pending().await
             } else {
                 Error::e_explain(ConnectError, "Sent data after end of body")
             }
         } else {
             self.read_body_bytes().await
         }
+    }
+
+    /// Whether the client has half-closed the TCP connection.
+    pub fn is_half_closed(&self) -> bool {
+        self.half_closed
     }
 
     /// Return the raw bytes of the request header.
